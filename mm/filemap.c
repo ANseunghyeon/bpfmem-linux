@@ -932,13 +932,15 @@ unlock:
 		goto error;
 
 	struct mem_cgroup *memcg = folio_memcg(folio);
-	/* cache_ext: Maintain the valid folios hashtable */
-	if (memcg->cache_ext_valid)
+	/* cache_ext: Maintain the valid folios hashtable and call folio_added hook */
+	if (memcg && memcg->cache_ext_valid) {
 		valid_folios_add(folio);
-	/* cache_ext: folio_added hook */
-	struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
-	if (pcext_ops != NULL && pcext_ops->folio_added != NULL)
-		pcext_ops->folio_added(folio);
+		/* cache_ext: folio_added hook */
+		struct cache_ext_ops *pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops != NULL && pcext_ops->folio_added != NULL) {
+			pcext_ops->folio_added(folio);
+		} 
+	}
 
 	trace_mm_filemap_add_to_page_cache(folio);
 	return 0;

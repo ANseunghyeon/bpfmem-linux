@@ -357,12 +357,14 @@ int cache_ext_list_iterate_extended(struct mem_cgroup *memcg,
 
 /*
  * Free the list.
+ * Note: We use list_del_init instead of list_del to avoid poisoned pointers.
+ * The node may be accessed later by valid_folios_del when the folio is evicted.
  */
 int cache_ext_list_free(struct cache_ext_list *list)
 {
 	struct cache_ext_list_node *node, *tmp;
 	list_for_each_entry_safe(node, tmp, &list->head, node) {
-		list_del(&node->node);
+		list_del_init(&node->node);
 	}
 
 	kfree(list);
@@ -548,6 +550,199 @@ bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
 		BUG();
 }
 
+/******************************************************************************
+ * Inheritance API ************************************************************
+ *****************************************************************************/
+
+ void cache_ext_inheritance_ctx_init(struct cache_ext_inheritance_ctx *ctx)
+ {
+	 INIT_LIST_HEAD(&ctx->orphan_list);
+	 ctx->num_pages = 0;
+	 ctx->prev_policy_id = 0;
+	 ctx->timestamp = 0;
+ }
+ 
+ struct cache_ext_inheritance_ctx *
+ cache_ext_get_inheritance_ctx(struct mem_cgroup *memcg)
+ {
+	 if (!memcg || !memcg->cache_ext_valid)
+		 return NULL;
+	 return &memcg->nodeinfo[0]->inheritance_ctx;
+ }
+ 
+ void cache_ext_prepare_inheritance(struct mem_cgroup *memcg)
+ {
+	 struct cache_ext_ds_registry *registry;
+	 struct cache_ext_inheritance_ctx *ctx;
+	 struct cache_ext_list *cur_list;
+	 struct cache_ext_list_node *node;
+	 struct valid_folios_set *valid_folios_set;
+	 struct hlist_node *tmp;
+	 int bkt;
+	 u64 list_count = 0;
+ 
+	 if (!memcg || !memcg->cache_ext_valid)
+		 return;
+ 
+	 registry = cache_ext_ds_registry_from_memcg(memcg);
+	 ctx = cache_ext_get_inheritance_ctx(memcg);
+	 if (!ctx)
+		 return;
+ 
+	 cache_ext_inheritance_ctx_init(ctx);
+	 ctx->timestamp = ktime_get_ns();
+ 
+	 write_lock(&registry->lock);
+ 
+	 // Move all nodes from policy lists to orphan_list and count them 
+	 hash_for_each_safe(registry->ds_hash, bkt, tmp, cur_list, h_node) {
+		 u64 node_count = 0;
+		 list_for_each_entry(node, &cur_list->head, node) {
+			 node_count++;
+		 }
+		 pr_info("cache_ext: List %llu has %llu nodes\n", list_count, node_count);
+		 list_count++;
+		 ctx->num_pages += node_count;
+		 
+		 list_splice_init(&cur_list->head, &ctx->orphan_list);
+		 hash_del(&cur_list->h_node);
+		 kfree(cur_list);
+	 }
+	 registry->nr_entries = 0;
+ 
+	 write_unlock(&registry->lock);
+ 
+	 // Debug: check valid_folios_set size
+	 valid_folios_set = memcg_to_valid_folios_set(memcg);
+	 if (valid_folios_set) {
+		 u64 vf_count = atomic64_read(&valid_folios_set->nr_entries);
+		 pr_info("cache_ext: valid_folios_set has %llu entries\n", vf_count);
+	 }
+ 
+	 pr_info("cache_ext: Prepared %llu pages for inheritance (from %llu lists)\n",
+		 ctx->num_pages, list_count);
+ }
+ 
+ // BPF kfunc: Move all orphan pages to target list
+ __bpf_kfunc u64 bpf_cache_ext_inherit_to_list(
+	 struct mem_cgroup *memcg,
+	 u64 target_list,
+	 u64 max_pages,
+	 bool add_to_head)
+ {
+	 struct cache_ext_inheritance_ctx *ctx;
+	 struct cache_ext_ds_registry *registry;
+	 struct cache_ext_list *list_ptr;
+	 struct cache_ext_list_node *node, *tmp_node;
+	 u64 moved = 0;
+ 
+	 ctx = cache_ext_get_inheritance_ctx(memcg);
+	 if (!ctx || list_empty(&ctx->orphan_list))
+		 return 0;
+ 
+	 registry = cache_ext_ds_registry_from_memcg(memcg);
+	 list_ptr = cache_ext_ds_registry_get(registry, target_list);
+	 if (!list_ptr)
+		 return 0;
+ 
+	 write_lock(&registry->lock);
+ 
+	 list_for_each_entry_safe(node, tmp_node, &ctx->orphan_list, node) {
+		 if (max_pages > 0 && moved >= max_pages)
+			 break;
+ 
+		 list_del_init(&node->node);
+ 
+		 if (add_to_head)
+			 list_add(&node->node, &list_ptr->head);
+		 else
+			 list_add_tail(&node->node, &list_ptr->head);
+ 
+		 moved++;
+	 }
+ 
+	 write_unlock(&registry->lock);
+	 ctx->num_pages -= moved;
+ 
+	 return moved;
+ }
+ 
+ // BPF kfunc: Get number of pages waiting for inheritance
+ __bpf_kfunc u64 bpf_cache_ext_inherit_get_count(struct mem_cgroup *memcg)
+ {
+	 struct cache_ext_inheritance_ctx *ctx = cache_ext_get_inheritance_ctx(memcg);
+	 if (!ctx)
+		 return 0;
+	 return ctx->num_pages;
+ }
+ 
+ // BPF kfunc: Check if there are pages to inherit
+ __bpf_kfunc bool bpf_cache_ext_inherit_has_pages(struct mem_cgroup *memcg)
+ {
+	 struct cache_ext_inheritance_ctx *ctx = cache_ext_get_inheritance_ctx(memcg);
+	 if (!ctx)
+		 return false;
+	 return !list_empty(&ctx->orphan_list);
+ }
+ 
+ // Callback type for iterate function
+ typedef int (*cache_ext_inherit_callback_t)(int idx, 
+											 struct cache_ext_list_node *node);
+ 
+ // BPF kfunc: Iterate through orphan pages with callback
+ __bpf_kfunc int bpf_cache_ext_inherit_iterate(
+	 struct mem_cgroup *memcg,
+	 u64 target_list,
+	 int (*callback)(int idx, struct cache_ext_list_node *node),
+	 u64 max_iter)
+ {
+	 struct cache_ext_inheritance_ctx *ctx;
+	 struct cache_ext_ds_registry *registry;
+	 struct cache_ext_list *list_ptr;
+	 struct cache_ext_list_node *node, *tmp_node;
+	 bpf_callback_t bpf_cb = (bpf_callback_t)callback;
+	 u64 iter = 0;
+	 int cb_ret;
+ 
+	 ctx = cache_ext_get_inheritance_ctx(memcg);
+	 if (!ctx || list_empty(&ctx->orphan_list))
+		 return 0;
+ 
+	 registry = cache_ext_ds_registry_from_memcg(memcg);
+	 list_ptr = cache_ext_ds_registry_get(registry, target_list);
+	 if (!list_ptr)
+		 return -1;
+ 
+	 write_lock(&registry->lock);
+ 
+	 list_for_each_entry_safe(node, tmp_node, &ctx->orphan_list, node) {
+		 if (max_iter > 0 && iter >= max_iter)
+			 break;
+ 
+		 // Call BPF callback
+		 cb_ret = bpf_cb((u64)iter, (u64)node, (u64)0, (u64)0, (u64)0);
+		 iter++;
+ 
+		 // Callback return values:
+		 // Callback return values:
+		 // 0 = continue, move to target_list tail
+		 // 1 = stop iteration
+		 // 2 = skip this node (don't move)
+		 if (cb_ret == 1) {
+			 break;
+		 } else if (cb_ret == 0) {
+			 list_del_init(&node->node);
+			 list_add_tail(&node->node, &list_ptr->head);
+			 ctx->num_pages--;
+		 }
+		 // cb_ret == 2: skip, don't move
+	 }
+ 
+	 write_unlock(&registry->lock);
+ 
+	 return iter;
+ }
+
 enum cache_ext_list_ops_type {
 	KF_bpf_cache_ext_list_add,
 	KF_bpf_cache_ext_list_add_tail,
@@ -556,6 +751,10 @@ enum cache_ext_list_ops_type {
 	KF_bpf_cache_ext_list_sample,
 	KF_bpf_cache_ext_list_move,
 	KF_bpf_cache_ext_list_iterate_extended,
+	KF_bpf_cache_ext_inherit_to_list,
+    KF_bpf_cache_ext_inherit_get_count,
+    KF_bpf_cache_ext_inherit_has_pages,
+    KF_bpf_cache_ext_inherit_iterate,
 };
 
 BTF_SET8_START(cache_ext_list_ops)
@@ -566,6 +765,10 @@ BTF_ID_FLAGS(func, bpf_cache_ext_list_iterate)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_sample)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_move)
 BTF_ID_FLAGS(func, bpf_cache_ext_list_iterate_extended)
+BTF_ID_FLAGS(func, bpf_cache_ext_inherit_to_list)
+BTF_ID_FLAGS(func, bpf_cache_ext_inherit_get_count)
+BTF_ID_FLAGS(func, bpf_cache_ext_inherit_has_pages)
+BTF_ID_FLAGS(func, bpf_cache_ext_inherit_iterate)
 BTF_SET8_END(cache_ext_list_ops)
 
 BTF_ID_LIST(cache_ext_list_ops_list)
@@ -576,6 +779,10 @@ BTF_ID(func, bpf_cache_ext_list_iterate)
 BTF_ID(func, bpf_cache_ext_list_sample)
 BTF_ID(func, bpf_cache_ext_list_move)
 BTF_ID(func, bpf_cache_ext_list_iterate_extended)
+BTF_ID(func, bpf_cache_ext_inherit_to_list)
+BTF_ID(func, bpf_cache_ext_inherit_get_count)
+BTF_ID(func, bpf_cache_ext_inherit_has_pages)
+BTF_ID(func, bpf_cache_ext_inherit_iterate)
 
 noinline bool cache_ext_is_callback_calling_kfunc_iterate(u32 btf_id)
 {
@@ -693,6 +900,9 @@ void cache_ext_ds_registry_write_unlock(struct folio *folio)
 
 void cache_ext_ds_registry_del_all(struct mem_cgroup *memcg)
 {
+	if (!memcg || !memcg->cache_ext_valid)
+		return;
+
 	int bkt;
 	struct hlist_node *tmp;
 	struct cache_ext_list *cur_list;
@@ -705,7 +915,8 @@ void cache_ext_ds_registry_del_all(struct mem_cgroup *memcg)
 	registry->nr_entries = 0;
 	write_unlock(&registry->lock);
 	struct valid_folios_set *valid_folios_set = memcg_to_valid_folios_set(memcg);
-	valid_folios_clear_list(valid_folios_set);
+	if (valid_folios_set)
+		valid_folios_clear_list(valid_folios_set);
 }
 
 // BPF API

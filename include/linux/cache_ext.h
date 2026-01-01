@@ -102,4 +102,7 @@ struct cache_ext_ds_registry *
 cache_ext_ds_registry_from_folio(struct folio *folio);
 struct cache_ext_ds_registry *
 cache_ext_ds_registry_from_memcg(struct mem_cgroup *memcg);
+void cache_ext_prepare_inheritance(struct mem_cgroup *memcg);
+void cache_ext_inheritance_ctx_init(struct cache_ext_inheritance_ctx *ctx);
+struct cache_ext_inheritance_ctx *cache_ext_get_inheritance_ctx(struct mem_cgroup *memcg);
 #endif // _LINUX_CACHE_EXT_H

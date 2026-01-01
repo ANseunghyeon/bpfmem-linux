@@ -927,6 +927,22 @@ static void bpf_cache_ext_ops_map_link_dealloc(struct bpf_link *link)
 		rcu_dereference_protected(st_link->map, true);
 	cgrp = st_link->cgroup;
 
+	/*
+	 * CRITICAL: Disable cache_ext BEFORE unreg and bpf_map_put!
+	 *
+	 * We must set cache_ext_enabled = false and cache_ext_ops = NULL
+	 * before calling unreg() and bpf_map_put(). Otherwise there's a
+	 * race window where:
+	 *   - cache_ext_enabled is still true
+	 *   - but cache_ext_ops points to freed memory (after bpf_map_put)
+	 */
+	down_write(&cgrp->bpf.cache_ext_sem);
+	cgroup_lock();
+	cgrp->bpf.cache_ext_enabled = false;
+	cgrp->bpf.cache_ext_ops = NULL;
+	cgroup_unlock();
+	up_write(&cgrp->bpf.cache_ext_sem);
+
 	if (st_map) {
 		/* st_link->map can be NULL if
 		 * bpf_struct_ops_link_create() fails to register.
@@ -936,12 +952,12 @@ static void bpf_cache_ext_ops_map_link_dealloc(struct bpf_link *link)
 	}
 
 	// Disable cache_ext
-	down_write(&cgrp->bpf.cache_ext_sem);
-	cgroup_lock();
-	cgrp->bpf.cache_ext_enabled = false;
-	cgrp->bpf.cache_ext_ops = NULL;
-	cgroup_unlock();
-	up_write(&cgrp->bpf.cache_ext_sem);
+	// down_write(&cgrp->bpf.cache_ext_sem);
+	// cgroup_lock();
+	// cgrp->bpf.cache_ext_enabled = false;
+	// cgrp->bpf.cache_ext_ops = NULL;
+	// cgroup_unlock();
+	// up_write(&cgrp->bpf.cache_ext_sem);
 
 	cgroup_put(cgrp);
 	kfree(st_link);

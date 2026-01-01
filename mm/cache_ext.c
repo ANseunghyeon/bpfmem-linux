@@ -118,7 +118,17 @@ static int bpf_cache_ext_reg(void *kdata, void *more_data)
 		}
 	}
 
-	pr_info("cache_ext: Registering struct ops\n");
+
+	if (ops->folio_added) {
+		cache_ext_call_folio_added_for_existing(memcg, ops);
+	}
+
+	struct cache_ext_inheritance_ctx *ctx = &memcg->nodeinfo[0]->inheritance_ctx;
+	if (!list_empty(&ctx->orphan_list) && ops->inherit_pages) {
+		pr_info("cache_ext: Calling inherit_pages hook with %llu pages\n",
+			ctx->num_pages);
+		ops->inherit_pages(memcg, ctx);
+	}
 	return 0;
 }
 
@@ -140,8 +150,11 @@ static void bpf_cache_ext_unreg(void *kdata, void *more_data)
 		pr_crit("cache_ext: failed to get memcg for release!\n");
 		return;
 	}
+	if (!memcg->cache_ext_valid)
+		return;
 	pr_info("cache_ext: unreg: Memcg pointer: %p\n", memcg);
-	cache_ext_ds_registry_del_all(memcg);
+	//cache_ext_ds_registry_del_all(memcg);
+	cache_ext_prepare_inheritance(memcg);
 }
 
 static int bpf_cache_ext_init_member(const struct btf_type *t,

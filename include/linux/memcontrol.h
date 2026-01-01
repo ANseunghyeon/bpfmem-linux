@@ -106,6 +106,8 @@ struct valid_folio *valid_folios_lookup(struct folio *folio);
 struct valid_folios_set *folio_to_valid_folios_set(struct folio *folio);
 spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set, struct folio *folio);
 void valid_folios_clear_list(struct valid_folios_set *valid_folios_set);
+void cache_ext_call_folio_added_for_existing(struct mem_cgroup *memcg,
+					     struct cache_ext_ops *ops);
 inline struct valid_folios_set *memcg_to_valid_folios_set(struct mem_cgroup *memcg);
 
 #define MEM_CGROUP_ID_SHIFT	16
@@ -173,6 +175,7 @@ struct mem_cgroup_per_node {
 	struct lruvec		lruvec;
 	struct valid_folios_set *valid_folios_set;
 	struct cache_ext_ds_registry cache_ext_ds_registry;
+	struct cache_ext_inheritance_ctx inheritance_ctx;
 
 	struct lruvec_stats_percpu __percpu	*lruvec_stats_percpu;
 	struct lruvec_stats			lruvec_stats;

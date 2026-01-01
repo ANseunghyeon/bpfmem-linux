@@ -396,16 +396,21 @@ void valid_folios_del(struct folio *folio) {
 	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
 		if (cur->folio_ptr == key) {
 			hash_del(&cur->h_node);
-			// TODO: If BPF has not removed it we are screwed!
-			// Change to dealloc in BPF.
 
 			cache_ext_ds_registry_write_lock(folio);
-			// Is it in a list currently? If so, remove it.
-			// if (!list_empty(&cur->cache_ext_node->node)) {
-			list_del(&cur->cache_ext_node->node);
-			//}
-			cache_ext_ds_registry_write_unlock(folio);
+			/*
+			 * Safely remove node from list only if it's still in one.
+			 * Use list_del_init to avoid poisoned pointer issues.
+			 * The node may have already been removed by:
+			 * - BPF folio_evicted hook
+			 * - cache_ext_list_free during policy unload
+			 * - cache_ext_prepare_inheritance (moved to orphan_list)
+			 */
+			if (!list_empty(&cur->cache_ext_node->node)) {
+				list_del_init(&cur->cache_ext_node->node);
+			}
 			cache_ext_list_node_free(cur->cache_ext_node);
+			cache_ext_ds_registry_write_unlock(folio);
 
 			kfree(cur);
 			spin_unlock(bucket_lock);
@@ -433,6 +438,46 @@ void valid_folios_clear_list(struct valid_folios_set *valid_folios_set) {
 		}
 		spin_unlock(bucket_lock);
 	}
+}
+
+/*
+ * Call folio_added hook for all existing folios in valid_folios_set.
+ * This is called when a new BPF policy is registered to ensure that
+ * existing cached folios are added to the policy's data structures.
+ */
+void cache_ext_call_folio_added_for_existing(struct mem_cgroup *memcg,
+					     struct cache_ext_ops *ops)
+{
+	struct valid_folios_set *valid_folios_set;
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+	u64 count = 0;
+
+	if (!memcg || !ops || !ops->folio_added)
+		return;
+
+	valid_folios_set = memcg_to_valid_folios_set(memcg);
+	if (!valid_folios_set)
+		return;
+
+	pr_info("cache_ext: Adding existing folios to new policy (vf_count=%lld)\n",
+		atomic64_read(&valid_folios_set->nr_entries));
+
+	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
+		bucket_lock = &valid_folios_set->bucket_locks[i];
+		spin_lock(bucket_lock);
+		hlist_for_each_entry(cur, &valid_folios_set->valid_folios[i], h_node) {
+			struct folio *folio = (struct folio *)cur->folio_ptr;
+			/* Call folio_added hook outside the lock to avoid deadlock */
+			spin_unlock(bucket_lock);
+			ops->folio_added(folio);
+			count++;
+			spin_lock(bucket_lock);
+		}
+		spin_unlock(bucket_lock);
+	}
+
+	pr_info("cache_ext: Added %llu existing folios to new policy\n", count);
 }
 
 bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio) {

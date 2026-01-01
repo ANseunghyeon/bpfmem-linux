@@ -1385,6 +1385,13 @@ struct cache_ext_eviction_ctx {
 	s64 scores[32];
 };
 
+struct cache_ext_inheritance_ctx {
+	struct list_head orphan_list;
+	u64 num_pages;
+	u64 prev_policy_id;
+	u64 timestamp;
+};
+
 struct cache_ext_admission_ctx {
 	u64 ino;
 	u64 offset;
@@ -1400,6 +1407,7 @@ struct cache_ext_ops {
 	void (*folio_accessed)(struct folio *folio);
 	void (*folio_evicted)(struct folio *folio);
 	bool (*admit_folio)(struct cache_ext_admission_ctx *ctx);
+	void (*inherit_pages)(struct mem_cgroup *memcg, struct cache_ext_inheritance_ctx *ctx);
 	// TODO: Add name?
 };
 
