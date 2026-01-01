@@ -787,7 +787,8 @@ BTF_ID(func, bpf_cache_ext_inherit_iterate)
 noinline bool cache_ext_is_callback_calling_kfunc_iterate(u32 btf_id)
 {
 	return (btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_iterate] ||
-		btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_iterate_extended]);
+		btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_list_iterate_extended] ||
+		btf_id == cache_ext_list_ops_list[KF_bpf_cache_ext_inherit_iterate]);
 }
 
 noinline bool cache_ext_is_callback_calling_kfunc_sample(u32 btf_id)
