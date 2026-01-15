@@ -624,48 +624,57 @@ bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
  }
  
  // BPF kfunc: Move all orphan pages to target list
- __bpf_kfunc u64 bpf_cache_ext_inherit_to_list(
+__bpf_kfunc u64 bpf_cache_ext_inherit_to_list(
 	 struct mem_cgroup *memcg,
 	 u64 target_list,
 	 u64 max_pages,
 	 bool add_to_head)
- {
+{
 	 struct cache_ext_inheritance_ctx *ctx;
 	 struct cache_ext_ds_registry *registry;
 	 struct cache_ext_list *list_ptr;
 	 struct cache_ext_list_node *node, *tmp_node;
 	 u64 moved = 0;
- 
+
 	 ctx = cache_ext_get_inheritance_ctx(memcg);
 	 if (!ctx || list_empty(&ctx->orphan_list))
 		 return 0;
- 
+
 	 registry = cache_ext_ds_registry_from_memcg(memcg);
 	 list_ptr = cache_ext_ds_registry_get(registry, target_list);
 	 if (!list_ptr)
 		 return 0;
- 
+
 	 write_lock(&registry->lock);
- 
-	 list_for_each_entry_safe(node, tmp_node, &ctx->orphan_list, node) {
-		 if (max_pages > 0 && moved >= max_pages)
-			 break;
- 
-		 list_del_init(&node->node);
- 
+
+	 if (max_pages == 0) {
+		 moved = ctx->num_pages;
 		 if (add_to_head)
-			 list_add(&node->node, &list_ptr->head);
+			 list_splice_init(&ctx->orphan_list, &list_ptr->head);
 		 else
-			 list_add_tail(&node->node, &list_ptr->head);
- 
-		 moved++;
+			 list_splice_tail_init(&ctx->orphan_list, &list_ptr->head);
+	 } else {
+		 // Move only max_pages nodes (O(n) but necessary for partial moves)
+		 list_for_each_entry_safe(node, tmp_node, &ctx->orphan_list, node) {
+			 if (moved >= max_pages)
+				 break;
+
+			 list_del_init(&node->node);
+
+			 if (add_to_head)
+				 list_add(&node->node, &list_ptr->head);
+			 else
+				 list_add_tail(&node->node, &list_ptr->head);
+
+			 moved++;
+		 }
 	 }
- 
+
 	 write_unlock(&registry->lock);
 	 ctx->num_pages -= moved;
- 
+
 	 return moved;
- }
+}
  
  // BPF kfunc: Get number of pages waiting for inheritance
  __bpf_kfunc u64 bpf_cache_ext_inherit_get_count(struct mem_cgroup *memcg)
