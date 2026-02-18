@@ -412,7 +412,7 @@ void valid_folios_del(struct folio *folio) {
 			cache_ext_list_node_free(cur->cache_ext_node);
 			cache_ext_ds_registry_write_unlock(folio);
 
-			kfree(cur);
+			kfree_rcu(cur, rcu);
 			spin_unlock(bucket_lock);
 			atomic64_fetch_add(-1, &valid_folios_set->nr_entries);
 			return;
@@ -452,6 +452,13 @@ void cache_ext_call_folio_added_for_existing(struct mem_cgroup *memcg,
 	struct valid_folio *cur;
 	spinlock_t *bucket_lock;
 	u64 count = 0;
+	/*
+	 * Use a batch size large enough to cover expected hash collisions.
+	 * With 2^23 buckets and typical memory sizes, collisions > 64 are extremely rare.
+	 */
+	#define CACHE_EXT_BATCH_SIZE 64
+	struct folio *folios[CACHE_EXT_BATCH_SIZE];
+	int nr_folios;
 
 	if (!memcg || !ops || !ops->folio_added)
 		return;
@@ -465,16 +472,40 @@ void cache_ext_call_folio_added_for_existing(struct mem_cgroup *memcg,
 
 	for (int i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
 		bucket_lock = &valid_folios_set->bucket_locks[i];
+		
 		spin_lock(bucket_lock);
+		nr_folios = 0;
 		hlist_for_each_entry(cur, &valid_folios_set->valid_folios[i], h_node) {
-			struct folio *folio = (struct folio *)cur->folio_ptr;
-			/* Call folio_added hook outside the lock to avoid deadlock */
-			spin_unlock(bucket_lock);
-			ops->folio_added(folio);
-			count++;
-			spin_lock(bucket_lock);
+			if (nr_folios >= CACHE_EXT_BATCH_SIZE) {
+				/*
+				 * If we hit this limit, we skip the remaining folios in this bucket.
+				 * Restarting iteration after unlocking is dangerous (cursor invalidation),
+				 * and infinite loops are possible if we don't track processed items.
+				 * Given the hash table size, this should practically never happen.
+				 */
+				pr_warn_once("cache_ext: bucket %d has too many entries, some folios skipped\n", i);
+				break;
+			}
+			
+			struct folio *f = (struct folio *)cur->folio_ptr;
+			/*
+			 * Try to get a reference. If the folio is being freed (refcount 0),
+			 * skip it. This prevents UAF when we access it later.
+			 */
+			if (folio_try_get(f)) {
+				folios[nr_folios++] = f;
+			}
 		}
 		spin_unlock(bucket_lock);
+		
+		for (int j = 0; j < nr_folios; j++) {
+			ops->folio_added(folios[j]);
+			folio_put(folios[j]);
+			count++;
+		}
+		
+		if (i % 64 == 0)
+			cond_resched();
 	}
 
 	pr_info("cache_ext: Added %llu existing folios to new policy\n", count);

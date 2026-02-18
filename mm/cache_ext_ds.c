@@ -54,7 +54,7 @@ struct cache_ext_list_node *cache_ext_list_node_alloc(struct folio *folio)
 void cache_ext_list_node_free(struct cache_ext_list_node *node)
 {
 	// TODO: Verify it's isolated first.
-	kfree(node);
+	kfree_rcu(node, rcu);
 }
 
 int __cache_ext_list_add_impl(struct cache_ext_list *list, struct folio *folio,
@@ -478,28 +478,42 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
 		pr_err("cache_ext: list is NULL\n");
 		return -1;
 	}
-	write_lock(&registry->lock);
+	int total_sampled = 0;
+	while (total_sampled < num_folios_to_sample) {
+		write_lock(&registry->lock);
 
-	// Optimization: Snip the front of the list and select the pages without
-	// holding the lock.
-	for (int i = 0; i < num_folios_to_sample; i++) {
 		if (list_empty(&list_ptr->head)) {
 			pr_warn("cache_ext: ran out of folios to sample\n");
-			__putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
+			__putback_list_nodes(list_ptr, sample_folios_arr, total_sampled);
 			write_unlock(&registry->lock);
+			for (int k = 0; k < total_sampled; k++) {
+				folio_put(sample_folios_arr[k]->folio);
+			}
 			return -1;
 		}
-		struct cache_ext_list_node *node = list_first_entry(
-			&list_ptr->head, struct cache_ext_list_node, node);
-		sample_folios_arr[i] = node;
-		sample_folios_size++;
-		// if (node->node.next == NULL || node->node.prev == NULL) {
-		// 	pr_warn("cache_ext: node->node.next or node->node.prev is NULL\n");
-		// }
-		list_del_init(&node->node);
-	}
 
-	write_unlock(&registry->lock);
+		int batch_limit = 32;
+		for (int i = 0; i < batch_limit && total_sampled < num_folios_to_sample; i++) {
+			if (list_empty(&list_ptr->head))
+				break;
+
+			struct cache_ext_list_node *node = list_first_entry(
+				&list_ptr->head, struct cache_ext_list_node, node);
+
+			if (!folio_try_get(node->folio)) {
+				list_del_init(&node->node);
+				// Don't increment total_sampled, retry
+				i--;
+				continue;
+			}
+
+			sample_folios_arr[total_sampled] = node;
+			list_del_init(&node->node);
+			total_sampled++;
+		}
+		write_unlock(&registry->lock);
+	}
+	sample_folios_size = total_sampled;
 
 	// 1. For every n elements, evict the one with the min score
 	ctx->nr_folios_to_evict = 0;
@@ -509,11 +523,6 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
 		s64 min_score = score_fn(min_node);
 
 		sample_folios_idx++;
-
-		// if (!min_node) {
-		// 	pr_warn("cache_ext: min_node is NULL, ran out of folios to evict\n");
-		// 	break;
-		// }
 
 		for (int j = 1; j < sample_size; j++) {
 			struct cache_ext_list_node *curr_node = sample_folios_arr[sample_folios_idx];
@@ -535,6 +544,10 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
 	__putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
 	write_unlock(&registry->lock);
 
+	for (int k = 0; k < sample_folios_size; k++) {
+		folio_put(sample_folios_arr[k]->folio);
+	}
+	cond_resched();
 	return 0;
 }
 

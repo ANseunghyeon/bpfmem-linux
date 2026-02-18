@@ -42,6 +42,7 @@ struct cache_ext_list_node {
 	struct folio *folio;
 
 	struct list_head node;
+	struct rcu_head rcu;
 };
 
 /*

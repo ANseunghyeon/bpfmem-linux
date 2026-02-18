@@ -91,6 +91,7 @@ struct valid_folio {
 	struct hlist_node h_node;
 	uintptr_t folio_ptr;
 	struct cache_ext_list_node *cache_ext_node;
+	struct rcu_head rcu;
 };
 
 // Function definitions for the valid_folios_set
